@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <EEPROM.h>
-#include <Encoder.h> 
+#include <Encoder.h> // 使用 Encoder 库来处理编码器
 
 /**
  * Dual-belt treadmill controller for Arduino Mega 2560.
@@ -55,33 +55,11 @@ enum class CommandMode
 
 struct CalibrationData
 {
-  uint16_t magic = 0xA5A5;  
   float kp[2];
   float ki[2];
   float kd[2];
   float feedForward[2];
 };
-
-void loadCalibration()
-{
-    CalibrationData calib; 
-
-    EEPROM.get(0, calib);
-    if (calib.magic != 0xA5A5) {
-        
-        calib.magic = 0xA5A5;
-        calib.kp[0] = 0.12f;
-        calib.kp[1] = 0.12f;
-        calib.ki[0] = 0.45f;
-        calib.ki[1] = 0.45f;
-        calib.kd[0] = 0.0008f;
-        calib.kd[1] = 0.0008f;
-        calib.feedForward[0] = 0.00025f;
-        calib.feedForward[1] = 0.00025f;
-
-        saveCalibration(); 
-    }
-}
 
 struct MotorState
 {
@@ -159,7 +137,20 @@ float countsToRpm(int32_t counts)
   return rps * 60.0f;
 }
 
+// ------------------------ Config handling (EEPROM) ---------------------------
+void loadCalibration()
+{
+   calib ={
+   {0.12f,0.12f},
+   {0.45f,0.45f},
+   {0.0008f,0.0008f},
+   {0.00025f,0.00025f},
+   };
 
+
+    saveCalibration(); // Write defaults to EEPROM
+
+}
 
 void saveCalibration()
 {
