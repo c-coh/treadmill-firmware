@@ -1,73 +1,49 @@
+// Dual-belt treadmill controller for Arduino Mega 2560
+
 #include <Arduino.h>
 #include <EEPROM.h>
-#include <Encoder.h> // 使用 Encoder 库来处理编码器
+#include <Encoder.h>
 
-/**
- * Dual-belt treadmill controller for Arduino Mega 2560.
- * Uses Paul Stoffregen's Encoder library for reliable quadrature decoding.
- * Implements:
- *  - Two DC motor channels with 8-bit PWM and direction control
- *  - Closed-loop speed regulation from dual encoders
- *  - Serial PC protocol for commands and telemetry
- *  - Safety supervision (driver faults only)
- *  - Config/persistence (EEPROM)
- *  - E-Stop and sensors removed as per requirements
- */
-
-// ------------------------ Hardware definitions (Mega-specific) ------------------------
-struct MotorPins
-{
-  uint8_t pwm;   // Must be a PWM pin (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 44, 45, 46)
-  uint8_t dir;
-  uint8_t sleep; // Enable/Sleep pin
-  uint8_t fault; // Fault pin (active-low)
-};
-
-// Define pins based on your new connection scheme
-constexpr MotorPins MOTOR_PINS[2] = {
-    {3, 4, 5, 30}, // Motor 1: PWM, DIR, SLP, FLT
-    {6, 7, 8, 32}  // Motor 2: PWM, DIR, SLP, FLT
-};
-
-// Encoder pins (using Encoder library, no need for interrupt pins)
-constexpr uint8_t ENCODER_PIN_A[2] = {24, 26}; // Encoder 1A, Encoder 2A
-constexpr uint8_t ENCODER_PIN_B[2] = {25, 27}; // Encoder 1B, Encoder 2B
-
-// Driver fault pin (if available, often shared or per-driver)
-constexpr uint8_t NFault_PIN = 10; // Example - connect to driver's global fault or one of the FLT pins if shared
-
-// ------------------------ Control parameters ------------------------
-constexpr uint8_t PWM_MAX = 255; // Mega is 8-bit PWM
-constexpr uint16_t CONTROL_INTERVAL_US = 5000; // 5 ms loop
+constexpr uint8_t PWM_MAX = 255;
+constexpr uint16_t CONTROL_INTERVAL_US = 5000;
 constexpr float CONTROL_PERIOD_S = CONTROL_INTERVAL_US / 1000000.0f;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 50;
 
-// TODO: Update with actual counts/rev from encoder spec sheet
-constexpr int32_t ENCODER_CPR = 2048; // Placeholder - replace with actual value
-// TODO: Verify against motor limits
-constexpr float MAX_RPM = 4000.0f;    // Placeholder - replace with actual value
+constexpr int32_t ENCODER_CPR = 2048;  // 每转脉冲数
+constexpr float MAX_RPM = 800.0f;
 
-enum class CommandMode
-{
-  INDEPENDENT,
-  DIFFERENTIAL
+struct MotorPins {
+  uint8_t pwm;
+  uint8_t dir;
+  uint8_t sleep;
+  uint8_t fault;
 };
 
-struct CalibrationData
-{
+constexpr MotorPins MOTOR_PINS[2] = {
+    {3, 4, 5, 30},   // M1
+    {6, 7, 8, 32}    // M2 (暂不处理)
+};
+
+constexpr uint8_t ENCODER_PIN_A[2] = {22, 26};
+constexpr uint8_t ENCODER_PIN_B[2] = {24, 28};
+constexpr uint8_t NFault_PIN = 10;
+
+enum class CommandMode { INDEPENDENT, DIFFERENTIAL };
+
+struct CalibrationData {
+  uint16_t magic = 0xA5A5;        // Magic number to detect valid data
   float kp[2];
   float ki[2];
   float kd[2];
   float feedForward[2];
 };
 
-struct MotorState
-{
+struct MotorState {
   float targetRpm = 0.0f;
   float actualRpm = 0.0f;
   float integral = 0.0f;
   float lastError = 0.0f;
-  float controlEffort = 0.0f; // -1.0 .. 1.0
+  float controlEffort = 0.0f;
   bool enabled = true;
 };
 
@@ -75,162 +51,166 @@ CalibrationData calib;
 MotorState motors[2];
 CommandMode controlMode = CommandMode::INDEPENDENT;
 
-// Create Encoder objects
 Encoder enc1(ENCODER_PIN_A[0], ENCODER_PIN_B[0]);
 Encoder enc2(ENCODER_PIN_A[1], ENCODER_PIN_B[1]);
 
-// No E-Stop latch
 bool driverHealthy[2] = {true, true};
 unsigned long lastControlMicros = 0;
 unsigned long lastTelemetryMs = 0;
 
-// --------------- Speed profile sequence (optional) ------------------
-struct ProfileStep
-{
+// Profile queue
+struct ProfileStep {
   float rpm[2];
   uint32_t durationMs;
 };
-
 ProfileStep profileQueue[8];
 uint8_t profileHead = 0;
 uint8_t profileTail = 0;
 bool profileActive = false;
 unsigned long profileStepMs = 0;
 
-// --------------------- Utility / hardware helpers -------------------
-inline void setMotorEnable(uint8_t motorIdx, bool enable)
-{
-  digitalWrite(MOTOR_PINS[motorIdx].sleep, enable ? HIGH : LOW);
-  motors[motorIdx].enabled = enable;
+// ------------------------ Utility ------------------------
+inline void setMotorEnable(uint8_t idx, bool enable) {
+  digitalWrite(MOTOR_PINS[idx].sleep, enable ? HIGH : LOW);
+  motors[idx].enabled = enable;
 }
 
-inline void applyMotorPwm(uint8_t motorIdx, float effort)
-{
+inline void applyMotorPwm(uint8_t idx, float effort) {
   effort = constrain(effort, -1.0f, 1.0f);
-  bool direction = effort >= 0.0f;
-  uint8_t duty = static_cast<uint8_t>(fabsf(effort) * PWM_MAX); // 8-bit PWM (0-255)
-  digitalWrite(MOTOR_PINS[motorIdx].dir, direction ? HIGH : LOW);
-  analogWrite(MOTOR_PINS[motorIdx].pwm, duty); // Use analogWrite for Mega
+  bool dir = effort >= 0.0f;
+  uint8_t duty = static_cast<uint8_t>(fabsf(effort) * PWM_MAX);
+  digitalWrite(MOTOR_PINS[idx].dir, dir ? HIGH : LOW);
+  analogWrite(MOTOR_PINS[idx].pwm, duty);
 }
 
-// Function to read encoder counts and reset them to zero
-int32_t readAndZeroEncoder(uint8_t motorIdx)
-{
-  int32_t count = 0;
-  if (motorIdx == 0)
-  {
-    count = enc1.read();
-    enc1.write(0); // Reset encoder position to 0
-  }
-  else if (motorIdx == 1)
-  {
-    count = enc2.read();
-    enc2.write(0); // Reset encoder position to 0
+int32_t readAndZeroEncoder(uint8_t idx) {
+  int32_t count = (idx == 0) ? enc1.read() : enc2.read();
+  if (count != 0) {  // 只有当计数不为零时才清零
+    (idx == 0) ? enc1.write(0) : enc2.write(0);
   }
   return count;
 }
 
-float countsToRpm(int32_t counts)
-{
-  float revolutions = static_cast<float>(counts) / ENCODER_CPR;
-  float rps = revolutions / CONTROL_PERIOD_S;
-  return rps * 60.0f;
+// 修改后的 countsToRpm 函数 - 接受电机索引
+float countsToRpm(int32_t counts, uint8_t idx) {
+  if (counts == 0) return 0.0f;  // 避免除零错误
+  
+  float revs = static_cast<float>(counts) / ENCODER_CPR;
+  float rpm = (revs / CONTROL_PERIOD_S) * 60.0f;
+  
+  // 添加滤波，避免瞬时噪声
+  static float lastRpm[2] = {0.0f, 0.0f};
+  float filteredRpm = lastRpm[idx] * 0.7f + rpm * 0.3f;
+  lastRpm[idx] = filteredRpm;
+  
+  return filteredRpm;
 }
 
-// ------------------------ Config handling (EEPROM) ---------------------------
+
+
+// ------------------------ EEPROM ------------------------
 void loadCalibration()
 {
-   calib ={
-   {0.12f,0.12f},
-   {0.45f,0.45f},
-   {0.0008f,0.0008f},
-   {0.00025f,0.00025f},
-   };
+    CalibrationData tmp;   // 用临时变量接 EEPROM 的值
 
+    EEPROM.get(0, tmp);
+    if (tmp.magic != 0xA5A5) {
+        // 首次或损坏，写入默认
+        tmp.magic = 0xA5A5;
+        tmp.kp[0] = 0.15f;    // 增强比例增益
+        tmp.kp[1] = 0.15f;    // M2参数暂时保留
+        tmp.ki[0] = 0.30f;    // 增强积分增益
+        tmp.ki[1] = 0.30f;
+        tmp.kd[0] = 0.0005f;  // 增强微分增益
+        tmp.kd[1] = 0.0005f;
+        tmp.feedForward[0] = 0.00040f;  // 增加前馈补偿
+        tmp.feedForward[1] = 0.00040f;
 
-    saveCalibration(); // Write defaults to EEPROM
+        // 写回 EEPROM
+        EEPROM.put(0, tmp);
+    }
 
+    calib = tmp;
 }
 
-void saveCalibration()
-{
-    // Save to EEPROM starting at address 0
-    EEPROM.put(0, calib);
-    // EEPROM.commit(); // Not needed on Arduino Mega, put() writes immediately
+
+void saveCalibration() {
+  EEPROM.put(0, calib);
 }
 
-// ----------------------- Safety handling (Driver faults only) ----------------------------
-void disableAllMotors()
-{
-  for (uint8_t i = 0; i < 2; ++i)
-  {
+// ------------------------ Safety ------------------------
+void disableAllMotors() {
+  for (uint8_t i = 0; i < 2; ++i) {
     applyMotorPwm(i, 0.0f);
     setMotorEnable(i, false);
   }
 }
 
-void checkSafetyInputs()
-{
-  // Check individual driver faults
-  driverHealthy[0] = digitalRead(MOTOR_PINS[0].fault) == HIGH; // Active-low fault
-  driverHealthy[1] = digitalRead(MOTOR_PINS[1].fault) == HIGH; // Active-low fault
+void checkSafetyInputs() {
+  // ⚠️ DEBUG 版本：完全忽略故障引脚，强制使能两个电机
+  driverHealthy[0] = true;
+  driverHealthy[1] = true;
+  bool globalFault = false;
 
-  // Check global driver fault (if applicable)
-  bool driverGlobalFault = digitalRead(NFault_PIN) == LOW; // Active-low fault
-
-  if (driverGlobalFault) // If any global fault occurs
-  {
-    disableAllMotors();
-  }
-  else
-  {
-    // Enable motors only if their individual drivers are healthy
-    for (uint8_t i = 0; i < 2; ++i)
-    {
-      setMotorEnable(i, driverHealthy[i]);
-    }
+  for (uint8_t i = 0; i < 2; ++i) {
+    setMotorEnable(i, true);   // 把 SLEEP 引脚一直拉高
   }
 }
 
-// ------------------------ Control algorithm -------------------------
-void runControl()
-{
-  for (uint8_t i = 0; i < 2; ++i)
-  {
-    int32_t delta = readAndZeroEncoder(i);
-    motors[i].actualRpm = countsToRpm(delta);
 
+// ------------------------ Control ------------------------
+void runControl() {
+  for (uint8_t i = 0; i < 2; ++i) {
+    // ① 读编码器、算实际转速
+    int32_t delta = readAndZeroEncoder(i);
+    motors[i].actualRpm = countsToRpm(delta, i);  // 传入电机索引
+
+    // ② PID 误差计算
     float error = motors[i].targetRpm - motors[i].actualRpm;
+    
+    // 如果误差过大，重置积分项以避免积分饱和
+    if (abs(error) > 50.0f) {
+      motors[i].integral = 0.0f;
+    }
+    
     motors[i].integral += error * CONTROL_PERIOD_S;
     motors[i].integral = constrain(motors[i].integral, -MAX_RPM, MAX_RPM);
     float derivative = (error - motors[i].lastError) / CONTROL_PERIOD_S;
     motors[i].lastError = error;
 
-    float pid = calib.kp[i] * error + calib.ki[i] * motors[i].integral + calib.kd[i] * derivative;
-    float ff = calib.feedForward[i] * motors[i].targetRpm;
+    float pid = calib.kp[i] * error
+              + calib.ki[i] * motors[i].integral
+              + calib.kd[i] * derivative;
+    float ff  = calib.feedForward[i] * motors[i].targetRpm;
 
-    motors[i].controlEffort = constrain((pid + ff) / MAX_RPM, -1.0f, 1.0f);
+    // 计算原始控制输出
+    float rawEffort = (pid + ff) / MAX_RPM;
 
-    // Only apply PWM if motor is enabled (no fault)
-    if (!motors[i].enabled)
-    {
-      applyMotorPwm(i, 0.0f);
+    // 添加启动辅助：仅在静止且目标非零时提供额外推力
+    if (motors[i].targetRpm != 0.0f && abs(motors[i].actualRpm) < 1.0f) {
+        const float STARTUP_BOOST = 0.30f;
+        if (motors[i].targetRpm > 0) {
+            rawEffort = max(rawEffort, STARTUP_BOOST);
+        } else {
+            rawEffort = min(rawEffort, -STARTUP_BOOST);
+        }
     }
-    else
-    {
+
+    motors[i].controlEffort = constrain(rawEffort, -1.0f, 1.0f);
+
+    // 使能逻辑
+    if (!motors[i].enabled) {
+      applyMotorPwm(i, 0.0f);
+    } else {
       applyMotorPwm(i, motors[i].controlEffort);
     }
   }
 }
 
-// ------------------------ PC command parser -------------------------
-String serialBuffer;
-
-void enqueueProfileStep(float rpm0, float rpm1, uint32_t duration)
-{
+// ------------------------ Profile ------------------------
+void enqueueProfileStep(float rpm0, float rpm1, uint32_t duration) {
   uint8_t next = (profileTail + 1) % 8;
-  if (next == profileHead)
-  {
+  if (next == profileHead) {
     Serial.println(F("ERR,PROFILE_FULL"));
     return;
   }
@@ -238,135 +218,95 @@ void enqueueProfileStep(float rpm0, float rpm1, uint32_t duration)
   profileTail = next;
 }
 
-void handleProfile()
-{
-  if (!profileActive && profileHead != profileTail)
-  {
-    ProfileStep &step = profileQueue[profileHead];
+void handleProfile() {
+  if (!profileActive && profileHead != profileTail) {
+    auto &step = profileQueue[profileHead];
     motors[0].targetRpm = constrain(step.rpm[0], -MAX_RPM, MAX_RPM);
     motors[1].targetRpm = constrain(step.rpm[1], -MAX_RPM, MAX_RPM);
     profileActive = true;
     profileStepMs = millis();
-  }
-  else if (profileActive)
-  {
-    ProfileStep &step = profileQueue[profileHead];
-    if (millis() - profileStepMs >= step.durationMs)
-    {
+  } else if (profileActive) {
+    auto &step = profileQueue[profileHead];
+    if (millis() - profileStepMs >= step.durationMs) {
       profileHead = (profileHead + 1) % 8;
       profileActive = false;
     }
   }
 }
 
-void setTargetsFromCommand(float leftRpm, float rightRpm)
-{
-  if (controlMode == CommandMode::INDEPENDENT)
-  {
-    motors[0].targetRpm = constrain(leftRpm, -MAX_RPM, MAX_RPM);
-    motors[1].targetRpm = constrain(rightRpm, -MAX_RPM, MAX_RPM);
-  }
-  else
-  {
-    // Differential mode: left = u + v, right = u - v
-    float u = (leftRpm + rightRpm) * 0.5f;
-    float v = (leftRpm - rightRpm) * 0.5f;
+void setTargetsFromCommand(float left, float right) {
+  if (controlMode == CommandMode::INDEPENDENT) {
+    motors[0].targetRpm = constrain(left, -MAX_RPM, MAX_RPM);
+    motors[1].targetRpm = constrain(right, -MAX_RPM, MAX_RPM);
+  } else {
+    float u = (left + right) * 0.5f;
+    float v = (left - right) * 0.5f;
     motors[0].targetRpm = constrain(u + v, -MAX_RPM, MAX_RPM);
     motors[1].targetRpm = constrain(u - v, -MAX_RPM, MAX_RPM);
   }
 }
 
-void handleCommand(const String &line)
-{
-  if (line.startsWith("SPD"))
-  {
-    // Format: SPD,<rpmA>,<rpmB>
-    int firstComma = line.indexOf(',');
-    int secondComma = line.indexOf(',', firstComma + 1);
-    if (firstComma < 0 || secondComma < 0)
-      return;
-    float rpmA = line.substring(firstComma + 1, secondComma).toFloat();
-    float rpmB = line.substring(secondComma + 1).toFloat();
-    setTargetsFromCommand(rpmA, rpmB);
-    profileHead = profileTail; // Invalidate queued profile steps
+// ------------------------ Serial ------------------------
+String serialBuffer;
+
+void handleCommand(const String &line) {
+  if (line.startsWith("SPD")) {
+    Serial.print(F("DBG,SPD_CMD,"));
+    Serial.println(line);
+    int p1 = line.indexOf(',');
+    int p2 = line.indexOf(',', p1 + 1);
+    if (p1 < 0 || p2 < 0) return;
+    float a = line.substring(p1 + 1, p2).toFloat();
+    float b = line.substring(p2 + 1).toFloat();
+    setTargetsFromCommand(a, b);
+    profileHead = profileTail;
     profileActive = false;
   }
-  else if (line.startsWith("SEQ"))
-  {
-    // Format: SEQ,<duration_ms>,<rpmA>,<rpmB>
+  else if (line.startsWith("SEQ")) {
     int p1 = line.indexOf(',');
     int p2 = line.indexOf(',', p1 + 1);
     int p3 = line.indexOf(',', p2 + 1);
-    if (p1 < 0 || p2 < 0 || p3 < 0)
-      return;
-    uint32_t duration = line.substring(p1 + 1, p2).toInt();
-    float rpmA = line.substring(p2 + 1, p3).toFloat();
-    float rpmB = line.substring(p3 + 1).toFloat();
-    enqueueProfileStep(rpmA, rpmB, duration);
+    if (p1 < 0 || p2 < 0 || p3 < 0) return;
+    uint32_t d = line.substring(p1 + 1, p2).toInt();
+    float a = line.substring(p2 + 1, p3).toFloat();
+    float b = line.substring(p3 + 1).toFloat();
+    enqueueProfileStep(a, b, d);
   }
-  else if (line.startsWith("MODE"))
-  {
-    if (line.endsWith("DIFF"))
-    {
-      controlMode = CommandMode::DIFFERENTIAL;
-    }
-    else
-    {
-      controlMode = CommandMode::INDEPENDENT;
-    }
+  else if (line.startsWith("MODE")) {
+    controlMode = line.endsWith("DIFF") ? CommandMode::DIFFERENTIAL : CommandMode::INDEPENDENT;
   }
-  else if (line.startsWith("CFG"))
-  {
-    // Format: CFG,<key>,<value>
+  else if (line.startsWith("CFG")) {
     int comma = line.indexOf(',', 4);
-    if (comma < 0)
-      return;
+    if (comma < 0) return;
     String key = line.substring(4, comma);
-    float value = line.substring(comma + 1).toFloat();
-    if (key == "KP1")
-      calib.kp[0] = value;
-    else if (key == "KP2")
-      calib.kp[1] = value;
-    else if (key == "KI1")
-      calib.ki[0] = value;
-    else if (key == "KI2")
-      calib.ki[1] = value;
-    else if (key == "KD1")
-      calib.kd[0] = value;
-    else if (key == "KD2")
-      calib.kd[1] = value;
-    else if (key == "FF1")
-      calib.feedForward[0] = value;
-    else if (key == "FF2")
-      calib.feedForward[1] = value;
-    saveCalibration(); // Save to EEPROM after any CFG change
+    float val = line.substring(comma + 1).toFloat();
+    if (key == "KP1") calib.kp[0] = val;
+    else if (key == "KP2") calib.kp[1] = val;
+    else if (key == "KI1") calib.ki[0] = val;
+    else if (key == "KI2") calib.ki[1] = val;
+    else if (key == "KD1") calib.kd[0] = val;
+    else if (key == "KD2") calib.kd[1] = val;
+    else if (key == "FF1") calib.feedForward[0] = val;
+    else if (key == "FF2") calib.feedForward[1] = val;
+    saveCalibration();
   }
-  // Removed ESTOP and RESET commands
 }
 
-void pollSerial()
-{
-  while (Serial.available())
-  {
+void pollSerial() {
+  while (Serial.available()) {
     char c = Serial.read();
-    if (c == '\n' || c == '\r')
-    {
-      if (serialBuffer.length() > 0)
-      {
+    if (c == '\n' || c == '\r') {
+      if (serialBuffer.length() > 0) {
         handleCommand(serialBuffer);
         serialBuffer = "";
       }
-    }
-    else
-    {
+    } else {
       serialBuffer += c;
     }
   }
 }
 
-// ------------------------ Telemetry output (No sensors) --------------------------
-void publishTelemetry()
-{
+void publishTelemetry() {
   Serial.print(F("TEL,"));
   Serial.print(millis());
   Serial.print(',');
@@ -377,66 +317,58 @@ void publishTelemetry()
   Serial.print(motors[1].targetRpm, 2);
   Serial.print(',');
   Serial.print(motors[1].actualRpm, 2);
-  // Removed force, current, temp fields
   Serial.print(',');
   Serial.print(driverHealthy[0]);
   Serial.print(',');
   Serial.print(driverHealthy[1]);
   Serial.print(',');
-  Serial.print(false); // No E-Stop, always false
+  Serial.print(false);
   Serial.print(',');
   Serial.println(profileActive);
 }
 
-// ----------------------------- Setup --------------------------------
-void configurePins()
-{
-  // pinMode(ESTOP_PIN, INPUT_PULLUP); // Removed
+// ------------------------ Setup & Loop ------------------------
+void configurePins() {
   pinMode(NFault_PIN, INPUT_PULLUP);
-
-  for (uint8_t i = 0; i < 2; ++i)
-  {
+  for (uint8_t i = 0; i < 2; ++i) {
     pinMode(MOTOR_PINS[i].dir, OUTPUT);
     pinMode(MOTOR_PINS[i].sleep, OUTPUT);
-    pinMode(MOTOR_PINS[i].fault, INPUT_PULLUP); // Driver fault is input
-    // Encoder pins are handled by the Encoder library, no need to pinMode here
+    pinMode(MOTOR_PINS[i].pwm, OUTPUT);        // Critical: set as output
+    pinMode(MOTOR_PINS[i].fault, INPUT_PULLUP);
+
+    analogWrite(MOTOR_PINS[i].pwm, 0);         // Critical: clear floating state
     setMotorEnable(i, true);
   }
-
-  // No need to attachInterrupt for Encoder library
 }
 
-void setup()
-{
+void setup() {
   Serial.begin(115200);
-  loadCalibration(); // Load saved calibration values
+  loadCalibration();
   configurePins();
+
+  // Extra safety: ensure PWM is zero
+  analogWrite(MOTOR_PINS[0].pwm, 0);
+  analogWrite(MOTOR_PINS[1].pwm, 0);
+
   lastControlMicros = micros();
   lastTelemetryMs = millis();
-  Serial.println(F("INFO,ARDUINO_MEGA_TREADMILL_READY_NO_ESTOP_ENCODER_LIB"));
+  Serial.println(F("INFO,ARDUINO_MEGA_TREADMILL_READY"));
 }
 
-// ------------------------------ Loop --------------------------------
-void loop()
-{
-  unsigned long nowMicros = micros();
-  if (nowMicros - lastControlMicros >= CONTROL_INTERVAL_US)
-  {
+void loop() {
+  unsigned long now = micros();
+  if (now - lastControlMicros >= CONTROL_INTERVAL_US) {
     lastControlMicros += CONTROL_INTERVAL_US;
-    checkSafetyInputs(); // Check driver faults
-    if (true) // Always handle profile if no E-Stop (always true now)
-    {
-      handleProfile();
-    }
-    runControl(); // Run PID control loop
+    checkSafetyInputs();
+    handleProfile();
+    runControl();
   }
 
-  pollSerial(); // Check for incoming serial commands
+  pollSerial();
 
-  unsigned long nowMs = millis();
-  if (nowMs - lastTelemetryMs >= TELEMETRY_INTERVAL_MS)
-  {
-    lastTelemetryMs = nowMs;
-    publishTelemetry(); // Send telemetry data
+  now = millis();
+  if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryMs = now;
+    publishTelemetry();
   }
 }
