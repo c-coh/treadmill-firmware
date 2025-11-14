@@ -9,7 +9,7 @@ constexpr uint16_t CONTROL_INTERVAL_US = 5000;
 constexpr float CONTROL_PERIOD_S = CONTROL_INTERVAL_US / 1000000.0f;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 50;
 
-constexpr int32_t ENCODER_CPR = 2048;  // 每转脉冲数
+constexpr int32_t ENCODER_CPR = 2048;  
 constexpr float MAX_RPM = 800.0f;
 
 struct MotorPins {
@@ -21,7 +21,7 @@ struct MotorPins {
 
 constexpr MotorPins MOTOR_PINS[2] = {
     {3, 4, 5, 30},   // M1
-    {6, 7, 8, 32}    // M2 (暂不处理)
+    {6, 7, 8, 32}    // M2 
 };
 
 constexpr uint8_t ENCODER_PIN_A[2] = {22, 26};
@@ -85,20 +85,20 @@ inline void applyMotorPwm(uint8_t idx, float effort) {
 
 int32_t readAndZeroEncoder(uint8_t idx) {
   int32_t count = (idx == 0) ? enc1.read() : enc2.read();
-  if (count != 0) {  // 只有当计数不为零时才清零
+  if (count != 0) {  
     (idx == 0) ? enc1.write(0) : enc2.write(0);
   }
   return count;
 }
 
-// 修改后的 countsToRpm 函数 - 接受电机索引
+
 float countsToRpm(int32_t counts, uint8_t idx) {
-  if (counts == 0) return 0.0f;  // 避免除零错误
+  if (counts == 0) return 0.0f;  
   
   float revs = static_cast<float>(counts) / ENCODER_CPR;
   float rpm = (revs / CONTROL_PERIOD_S) * 60.0f;
   
-  // 添加滤波，避免瞬时噪声
+
   static float lastRpm[2] = {0.0f, 0.0f};
   float filteredRpm = lastRpm[idx] * 0.7f + rpm * 0.3f;
   lastRpm[idx] = filteredRpm;
@@ -111,22 +111,22 @@ float countsToRpm(int32_t counts, uint8_t idx) {
 // ------------------------ EEPROM ------------------------
 void loadCalibration()
 {
-    CalibrationData tmp;   // 用临时变量接 EEPROM 的值
+    CalibrationData tmp;   
 
     EEPROM.get(0, tmp);
     if (tmp.magic != 0xA5A5) {
-        // 首次或损坏，写入默认
+        
         tmp.magic = 0xA5A5;
-        tmp.kp[0] = 0.15f;    // 增强比例增益
-        tmp.kp[1] = 0.15f;    // M2参数暂时保留
-        tmp.ki[0] = 0.30f;    // 增强积分增益
+        tmp.kp[0] = 0.15f;    
+        tmp.kp[1] = 0.15f;    
+        tmp.ki[0] = 0.30f;   
         tmp.ki[1] = 0.30f;
-        tmp.kd[0] = 0.0005f;  // 增强微分增益
+        tmp.kd[0] = 0.0005f;  
         tmp.kd[1] = 0.0005f;
-        tmp.feedForward[0] = 0.00040f;  // 增加前馈补偿
+        tmp.feedForward[0] = 0.00040f; 
         tmp.feedForward[1] = 0.00040f;
 
-        // 写回 EEPROM
+        
         EEPROM.put(0, tmp);
     }
 
@@ -147,13 +147,13 @@ void disableAllMotors() {
 }
 
 void checkSafetyInputs() {
-  // ⚠️ DEBUG 版本：完全忽略故障引脚，强制使能两个电机
+  
   driverHealthy[0] = true;
   driverHealthy[1] = true;
   bool globalFault = false;
 
   for (uint8_t i = 0; i < 2; ++i) {
-    setMotorEnable(i, true);   // 把 SLEEP 引脚一直拉高
+    setMotorEnable(i, true);   
   }
 }
 
@@ -161,14 +161,14 @@ void checkSafetyInputs() {
 // ------------------------ Control ------------------------
 void runControl() {
   for (uint8_t i = 0; i < 2; ++i) {
-    // ① 读编码器、算实际转速
+    
     int32_t delta = readAndZeroEncoder(i);
-    motors[i].actualRpm = countsToRpm(delta, i);  // 传入电机索引
+    motors[i].actualRpm = countsToRpm(delta, i);  
 
-    // ② PID 误差计算
+    
     float error = motors[i].targetRpm - motors[i].actualRpm;
     
-    // 如果误差过大，重置积分项以避免积分饱和
+    
     if (abs(error) > 50.0f) {
       motors[i].integral = 0.0f;
     }
@@ -183,10 +183,10 @@ void runControl() {
               + calib.kd[i] * derivative;
     float ff  = calib.feedForward[i] * motors[i].targetRpm;
 
-    // 计算原始控制输出
+    
     float rawEffort = (pid + ff) / MAX_RPM;
 
-    // 添加启动辅助：仅在静止且目标非零时提供额外推力
+    
     if (motors[i].targetRpm != 0.0f && abs(motors[i].actualRpm) < 1.0f) {
         const float STARTUP_BOOST = 0.30f;
         if (motors[i].targetRpm > 0) {
@@ -198,7 +198,7 @@ void runControl() {
 
     motors[i].controlEffort = constrain(rawEffort, -1.0f, 1.0f);
 
-    // 使能逻辑
+    
     if (!motors[i].enabled) {
       applyMotorPwm(i, 0.0f);
     } else {
