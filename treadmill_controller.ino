@@ -8,8 +8,10 @@ constexpr uint8_t PWM_MAX = 255;
 constexpr uint16_t CONTROL_INTERVAL_US = 5000;
 constexpr float CONTROL_PERIOD_S = CONTROL_INTERVAL_US / 1000000.0f;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 50;
+constexpr float RPM_SCALE = 0.6f;  
 
-constexpr int32_t ENCODER_CPR = 2048;  
+
+constexpr int32_t ENCODER_CPR = 200;  
 constexpr float MAX_RPM = 800.0f;
 
 struct MotorPins {
@@ -77,11 +79,17 @@ inline void setMotorEnable(uint8_t idx, bool enable) {
 
 inline void applyMotorPwm(uint8_t idx, float effort) {
   effort = constrain(effort, -1.0f, 1.0f);
+
   bool dir = effort >= 0.0f;
+  if (idx == 1) {
+    dir = !dir;
+  }
+
   uint8_t duty = static_cast<uint8_t>(fabsf(effort) * PWM_MAX);
   digitalWrite(MOTOR_PINS[idx].dir, dir ? HIGH : LOW);
   analogWrite(MOTOR_PINS[idx].pwm, duty);
 }
+
 
 int32_t readAndZeroEncoder(uint8_t idx) {
   int32_t count = (idx == 0) ? enc1.read() : enc2.read();
@@ -94,18 +102,20 @@ int32_t readAndZeroEncoder(uint8_t idx) {
 
 float countsToRpm(int32_t counts, uint8_t idx) {
   if (counts == 0) return 0.0f;  
-  
+
   float revs = static_cast<float>(counts) / ENCODER_CPR;
-  float rpm = (revs / CONTROL_PERIOD_S) * 60.0f;
+  float rpm  = (revs / CONTROL_PERIOD_S) * 60.0f;
+
   
+  rpm *= RPM_SCALE;   
+  rpm = fabsf(rpm);   
 
   static float lastRpm[2] = {0.0f, 0.0f};
   float filteredRpm = lastRpm[idx] * 0.7f + rpm * 0.3f;
   lastRpm[idx] = filteredRpm;
-  
+
   return filteredRpm;
 }
-
 
 
 // ------------------------ EEPROM ------------------------
