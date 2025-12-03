@@ -8,13 +8,14 @@ constexpr uint8_t PWM_MAX = 255;
 constexpr uint16_t CONTROL_INTERVAL_US = 5000;
 constexpr float CONTROL_PERIOD_S = CONTROL_INTERVAL_US / 1000000.0f;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 50;
-constexpr float RPM_SCALE = 0.6f;  
+constexpr uint32_t WATCHDOG_TIMEOUT_MS = 2000; // Stop motors if no heartbeat for 2 seconds
+constexpr float RPM_SCALE = 0.6f;
 
-
-constexpr int32_t ENCODER_CPR = 200;  
+constexpr int32_t ENCODER_CPR = 200;
 constexpr float MAX_RPM = 800.0f;
 
-struct MotorPins {
+struct MotorPins
+{
   uint8_t pwm;
   uint8_t dir;
   uint8_t sleep;
@@ -30,9 +31,14 @@ constexpr uint8_t ENCODER_PIN_A[2] = {22, 26};
 constexpr uint8_t ENCODER_PIN_B[2] = {24, 28};
 constexpr uint8_t NFault_PIN = 10;
 
-enum class CommandMode { INDEPENDENT, DIFFERENTIAL };
+enum class CommandMode
+{
+  INDEPENDENT,
+  DIFFERENTIAL
+};
 
-struct CalibrationData {
+struct CalibrationData
+{
   uint16_t magic = 0xA5A5; // Magic number to detect valid data
   float kp[2];
   float ki[2];
@@ -40,7 +46,8 @@ struct CalibrationData {
   float feedForward[2];
 };
 
-struct MotorState {
+struct MotorState
+{
   float targetRpm = 0.0f;
   float actualRpm = 0.0f;
   float integral = 0.0f;
@@ -59,10 +66,12 @@ Encoder enc2(ENCODER_PIN_A[1], ENCODER_PIN_B[1]);
 bool driverHealthy[2] = {true, true};
 unsigned long lastControlMicros = 0;
 unsigned long lastTelemetryMs = 0;
+unsigned long lastHeartbeatMs = 0;
 
 // Profile queue
 constexpr uint8_t MAX_PROFILE_STEPS = 64;
-struct ProfileStep {
+struct ProfileStep
+{
   float rpm[2];
   uint32_t durationMs;
 };
@@ -73,16 +82,19 @@ bool profileActive = false;
 unsigned long profileStepMs = 0;
 
 // ------------------------ Utility ------------------------
-inline void setMotorEnable(uint8_t idx, bool enable) {
+inline void setMotorEnable(uint8_t idx, bool enable)
+{
   digitalWrite(MOTOR_PINS[idx].sleep, enable ? HIGH : LOW);
   motors[idx].enabled = enable;
 }
 
-inline void applyMotorPwm(uint8_t idx, float effort) {
+inline void applyMotorPwm(uint8_t idx, float effort)
+{
   effort = constrain(effort, -1.0f, 1.0f);
 
   bool dir = effort >= 0.0f;
-  if (idx == 1) {
+  if (idx == 1)
+  {
     dir = !dir;
   }
 
@@ -91,23 +103,26 @@ inline void applyMotorPwm(uint8_t idx, float effort) {
   analogWrite(MOTOR_PINS[idx].pwm, duty);
 }
 
-int32_t readAndZeroEncoder(uint8_t idx) {
+int32_t readAndZeroEncoder(uint8_t idx)
+{
   int32_t count = (idx == 0) ? enc1.read() : enc2.read();
-  if (count != 0) {
+  if (count != 0)
+  {
     (idx == 0) ? enc1.write(0) : enc2.write(0);
   }
   return count;
 }
 
-float countsToRpm(int32_t counts, uint8_t idx) {
-  if (counts == 0) return 0.0f;  
+float countsToRpm(int32_t counts, uint8_t idx)
+{
+  if (counts == 0)
+    return 0.0f;
 
   float revs = static_cast<float>(counts) / ENCODER_CPR;
   float rpm = (revs / CONTROL_PERIOD_S) * 60.0f;
 
-  
-  rpm *= RPM_SCALE;   
-  rpm = fabsf(rpm);   
+  rpm *= RPM_SCALE;
+  rpm = fabsf(rpm);
 
   static float lastRpm[2] = {0.0f, 0.0f};
   float filteredRpm = lastRpm[idx] * 0.7f + rpm * 0.3f;
@@ -119,99 +134,101 @@ float countsToRpm(int32_t counts, uint8_t idx) {
 // ------------------------ EEPROM ------------------------
 void loadCalibration()
 {
-    CalibrationData tmp;   
+  CalibrationData tmp;
 
-    EEPROM.get(0, tmp);
-    if (tmp.magic != 0xA5A5) {
-        
-        tmp.magic = 0xA5A5;
-        tmp.kp[0] = 0.15f;    
-        tmp.kp[1] = 0.15f;    
-        tmp.ki[0] = 0.30f;   
-        tmp.ki[1] = 0.30f;
-        tmp.kd[0] = 0.0005f;  
-        tmp.kd[1] = 0.0005f;
-        tmp.feedForward[0] = 0.00040f; 
-        tmp.feedForward[1] = 0.00040f;
+  EEPROM.get(0, tmp);
+  if (tmp.magic != 0xA5A5)
+  {
 
-        
-        EEPROM.put(0, tmp);
-    }
+    tmp.magic = 0xA5A5;
+    tmp.kp[0] = 0.15f;
+    tmp.kp[1] = 0.15f;
+    tmp.ki[0] = 0.30f;
+    tmp.ki[1] = 0.30f;
+    tmp.kd[0] = 0.0005f;
+    tmp.kd[1] = 0.0005f;
+    tmp.feedForward[0] = 0.00040f;
+    tmp.feedForward[1] = 0.00040f;
+
+    EEPROM.put(0, tmp);
+  }
 
   calib = tmp;
 }
 
-void saveCalibration() {
+void saveCalibration()
+{
   EEPROM.put(0, calib);
 }
 
 // ------------------------ Safety ------------------------
-void disableAllMotors() {
-  for (uint8_t i = 0; i < 2; ++i) {
+void disableAllMotors()
+{
+  for (uint8_t i = 0; i < 2; ++i)
+  {
     applyMotorPwm(i, 0.0f);
     setMotorEnable(i, false);
   }
 }
 
-void checkSafetyInputs() {
-  
-  driverHealthy[0] = true;
-  driverHealthy[1] = true;
-  bool globalFault = false;
-
-  for (uint8_t i = 0; i < 2; ++i) {
-    setMotorEnable(i, true);   
-  }
-}
-
 // ------------------------ Control ------------------------
-void runControl() {
-  for (uint8_t i = 0; i < 2; ++i) {
-    
+void runControl()
+{
+  for (uint8_t i = 0; i < 2; ++i)
+  {
+
     int32_t delta = readAndZeroEncoder(i);
-    motors[i].actualRpm = countsToRpm(delta, i);  
+    motors[i].actualRpm = countsToRpm(delta, i);
 
     float error = motors[i].targetRpm - motors[i].actualRpm;
 
-    if (abs(error) > 50.0f) {
+    if (abs(error) > 50.0f)
+    {
       motors[i].integral = 0.0f;
     }
-    
+
     motors[i].integral += error * CONTROL_PERIOD_S;
     motors[i].integral = constrain(motors[i].integral, -MAX_RPM, MAX_RPM);
     float derivative = (error - motors[i].lastError) / CONTROL_PERIOD_S;
     motors[i].lastError = error;
 
-    float pid = calib.kp[i] * error
-              + calib.ki[i] * motors[i].integral
-              + calib.kd[i] * derivative;
-    float ff  = calib.feedForward[i] * motors[i].targetRpm;
+    float pid = calib.kp[i] * error + calib.ki[i] * motors[i].integral + calib.kd[i] * derivative;
+    float ff = calib.feedForward[i] * motors[i].targetRpm;
 
     float rawEffort = (pid + ff) / MAX_RPM;
 
-    if (motors[i].targetRpm != 0.0f && abs(motors[i].actualRpm) < 1.0f) {
-        const float STARTUP_BOOST = 0.30f;
-        if (motors[i].targetRpm > 0) {
-            rawEffort = max(rawEffort, STARTUP_BOOST);
-        } else {
-            rawEffort = min(rawEffort, -STARTUP_BOOST);
-        }
+    if (motors[i].targetRpm != 0.0f && abs(motors[i].actualRpm) < 1.0f)
+    {
+      const float STARTUP_BOOST = 0.30f;
+      if (motors[i].targetRpm > 0)
+      {
+        rawEffort = max(rawEffort, STARTUP_BOOST);
+      }
+      else
+      {
+        rawEffort = min(rawEffort, -STARTUP_BOOST);
+      }
     }
 
     motors[i].controlEffort = constrain(rawEffort, -1.0f, 1.0f);
 
-    if (!motors[i].enabled) {
+    if (!motors[i].enabled)
+    {
       applyMotorPwm(i, 0.0f);
-    } else {
+    }
+    else
+    {
       applyMotorPwm(i, motors[i].controlEffort);
     }
   }
 }
 
 // ------------------------ Profile ------------------------
-void enqueueProfileStep(float rpm0, float rpm1, uint32_t duration) {
+void enqueueProfileStep(float rpm0, float rpm1, uint32_t duration)
+{
   uint8_t next = (profileTail + 1) % MAX_PROFILE_STEPS;
-  if (next == profileHead) {
+  if (next == profileHead)
+  {
     Serial.println(F("ERR,PROFILE_FULL"));
     return;
   }
@@ -219,27 +236,49 @@ void enqueueProfileStep(float rpm0, float rpm1, uint32_t duration) {
   profileTail = next;
 }
 
-void handleProfile() {
-  if (!profileActive && profileHead != profileTail) {
+void handleProfile()
+{
+  if (!profileActive && profileHead != profileTail)
+  {
     auto &step = profileQueue[profileHead];
     motors[0].targetRpm = constrain(step.rpm[0], -MAX_RPM, MAX_RPM);
     motors[1].targetRpm = constrain(step.rpm[1], -MAX_RPM, MAX_RPM);
     profileActive = true;
     profileStepMs = millis();
-  } else if (profileActive) {
+  }
+  else if (profileActive)
+  {
     auto &step = profileQueue[profileHead];
-    if (millis() - profileStepMs >= step.durationMs) {
+    if (millis() - profileStepMs >= step.durationMs)
+    {
       profileHead = (profileHead + 1) % MAX_PROFILE_STEPS;
-      profileActive = false;
+
+      // Immediately check for next step to prevent profileActive flickering to false
+      if (profileHead != profileTail)
+      {
+        auto &nextStep = profileQueue[profileHead];
+        motors[0].targetRpm = constrain(nextStep.rpm[0], -MAX_RPM, MAX_RPM);
+        motors[1].targetRpm = constrain(nextStep.rpm[1], -MAX_RPM, MAX_RPM);
+        profileActive = true;
+        profileStepMs = millis();
+      }
+      else
+      {
+        profileActive = false;
+      }
     }
   }
 }
 
-void setTargetsFromCommand(float left, float right) {
-  if (controlMode == CommandMode::INDEPENDENT) {
+void setTargetsFromCommand(float left, float right)
+{
+  if (controlMode == CommandMode::INDEPENDENT)
+  {
     motors[0].targetRpm = constrain(left, -MAX_RPM, MAX_RPM);
     motors[1].targetRpm = constrain(right, -MAX_RPM, MAX_RPM);
-  } else {
+  }
+  else
+  {
     float u = (left + right) * 0.5f;
     float v = (left - right) * 0.5f;
     motors[0].targetRpm = constrain(u + v, -MAX_RPM, MAX_RPM);
@@ -248,7 +287,8 @@ void setTargetsFromCommand(float left, float right) {
 }
 
 // ------------------------ Serial ------------------------
-enum class SystemState {
+enum class SystemState
+{
   IDLE,      // Waiting for commands, manual control allowed
   UPLOADING, // Receiving profile data
   RUNNING    // Executing profile
@@ -260,7 +300,8 @@ const uint8_t MAX_CMD_LEN = 64;
 char serialBuf[MAX_CMD_LEN];
 uint8_t serialPos = 0;
 
-void parseProfileCommand(char *cmd) {
+void parseProfileCommand(char *cmd)
+{
   // Format: L:1.5 R:2.0 T:3.0
   float lSpeed = 0, rSpeed = 0, duration = 0;
 
@@ -268,21 +309,25 @@ void parseProfileCommand(char *cmd) {
   char *pR = strstr(cmd, "R:");
   char *pT = strstr(cmd, "T:");
 
-  if (pL && pR && pT) {
+  if (pL && pR && pT)
+  {
     lSpeed = atof(pL + 2);
     rSpeed = atof(pR + 2);
     duration = atof(pT + 2);
     enqueueProfileStep(lSpeed, rSpeed, (uint32_t)(duration * 1000));
     Serial.println(F("READY"));
   }
-  else {
+  else
+  {
     Serial.println(F("ERR,PARSE_FMT"));
   }
 }
 
-void handleCommand(char *cmd) {
-  // 1. CRITICAL: Always check for STOP first
-  if (strcmp(cmd, "STOP_TM") == 0) {
+void handleCommand(char *cmd)
+{
+  // ALWAYS check for STOP first
+  if (strcmp(cmd, "STOP_TM") == 0)
+  {
     disableAllMotors();
     motors[0].targetRpm = 0;
     motors[1].targetRpm = 0;
@@ -294,38 +339,47 @@ void handleCommand(char *cmd) {
     return;
   }
 
-  switch (systemState) {
+  switch (systemState)
+  {
   case SystemState::RUNNING:
     // Ignore everything else during run to prevent jitter
-    if (strncmp(cmd, "SPD", 3) == 0 || strncmp(cmd, "START", 5) == 0) {
+    if (strncmp(cmd, "SPD", 3) == 0 || strncmp(cmd, "START", 5) == 0)
+    {
       Serial.println(F("ERR,BUSY_RUNNING"));
     }
     break;
 
   case SystemState::IDLE:
-    if (strcmp(cmd, "START_READ") == 0) {
+    if (strcmp(cmd, "START_READ") == 0)
+    {
       profileHead = 0;
       profileTail = 0;
       profileActive = false;
       systemState = SystemState::UPLOADING;
       Serial.println(F("READY"));
     }
-    else if (strncmp(cmd, "RUN_TM", 6) == 0) {
-      if (profileHead != profileTail) {
+    else if (strncmp(cmd, "RUN_TM", 6) == 0)
+    {
+      if (profileHead != profileTail)
+      {
         systemState = SystemState::RUNNING;
         profileActive = false;
         Serial.println(F("RUNNING"));
       }
-      else {
+      else
+      {
         Serial.println(F("ERR,NO_PROFILE"));
       }
     }
-    else if (strncmp(cmd, "SPD", 3) == 0) {
+    else if (strncmp(cmd, "SPD", 3) == 0)
+    {
       // SPD,100,100
       char *p1 = strchr(cmd, ',');
-      if (p1) {
+      if (p1)
+      {
         char *p2 = strchr(p1 + 1, ',');
-        if (p2) {
+        if (p2)
+        {
           float a = atof(p1 + 1);
           float b = atof(p2 + 1);
           setTargetsFromCommand(a, b);
@@ -334,14 +388,18 @@ void handleCommand(char *cmd) {
         }
       }
     }
-    else if (strncmp(cmd, "SEQ", 3) == 0) {
+    else if (strncmp(cmd, "SEQ", 3) == 0)
+    {
       // SEQ,1000,10.0,10.0
       char *p1 = strchr(cmd, ',');
-      if (p1) {
+      if (p1)
+      {
         char *p2 = strchr(p1 + 1, ',');
-        if (p2) {
+        if (p2)
+        {
           char *p3 = strchr(p2 + 1, ',');
-          if (p3) {
+          if (p3)
+          {
             uint32_t d = atol(p1 + 1);
             float a = atof(p2 + 1);
             float b = atof(p3 + 1);
@@ -358,12 +416,20 @@ void handleCommand(char *cmd) {
       else
         controlMode = CommandMode::INDEPENDENT;
     }
-    else if (strncmp(cmd, "CFG", 3) == 0) {
+    else if (strcmp(cmd, "HEARTBEAT") == 0)
+    {
+      lastHeartbeatMs = millis();
+      // No response needed for heartbeat
+    }
+    else if (strncmp(cmd, "CFG", 3) == 0)
+    {
       // CFG,KP1,0.15
       char *pKey = strchr(cmd, ',');
-      if (pKey) {
+      if (pKey)
+      {
         char *pVal = strchr(pKey + 1, ',');
-        if (pVal) {
+        if (pVal)
+        {
           *pVal = 0; // Terminate key string
           char *key = pKey + 1;
           float val = atof(pVal + 1);
@@ -391,39 +457,55 @@ void handleCommand(char *cmd) {
     break;
 
   case SystemState::UPLOADING:
-    if (strncmp(cmd, "L:", 2) == 0) {
+    if (strncmp(cmd, "L:", 2) == 0)
+    {
       parseProfileCommand(cmd);
     }
-    else if (strcmp(cmd, "END_READ") == 0) {
+    else if (strcmp(cmd, "END_READ") == 0)
+    {
       systemState = SystemState::IDLE;
       Serial.println(F("ACK"));
     }
-    else {
+    else
+    {
       Serial.println(F("ERR,EXPECTED_PROFILE_DATA"));
     }
     break;
   }
 }
 
-void pollSerial() {
-  while (Serial.available()) {
+void pollSerial()
+{
+  while (Serial.available())
+  {
     char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (serialPos > 0) {
+    if (c == '\n' || c == '\r')
+    {
+      if (serialPos > 0)
+      {
         serialBuf[serialPos] = '\0';
         handleCommand(serialBuf);
         serialPos = 0;
       }
     }
-    else {
-      if (serialPos < MAX_CMD_LEN - 1) {
+    else
+    {
+      if (serialPos < MAX_CMD_LEN - 1)
+      {
         serialBuf[serialPos++] = c;
+      }
+      else
+      {
+        // Buffer overflow protection: discard characters until newline
+        // This prevents a long garbage string from being interpreted as a valid command prefix
+        // or corrupting the next command.
       }
     }
   }
 }
 
-void publishTelemetry() {
+void publishTelemetry()
+{
   Serial.print(F("TEL,"));
   Serial.print(millis());
   Serial.print(',');
@@ -445,9 +527,11 @@ void publishTelemetry() {
 }
 
 // ------------------------ Setup & Loop ------------------------
-void configurePins() {
+void configurePins()
+{
   pinMode(NFault_PIN, INPUT_PULLUP);
-  for (uint8_t i = 0; i < 2; ++i) {
+  for (uint8_t i = 0; i < 2; ++i)
+  {
     pinMode(MOTOR_PINS[i].dir, OUTPUT);
     pinMode(MOTOR_PINS[i].sleep, OUTPUT);
     pinMode(MOTOR_PINS[i].pwm, OUTPUT); // Critical: set as output
@@ -458,8 +542,9 @@ void configurePins() {
   }
 }
 
-void setup() {
-  Serial.begin(115200);
+void setup()
+{
+  Serial.begin(500000);
   loadCalibration();
   configurePins();
 
@@ -469,23 +554,44 @@ void setup() {
 
   lastControlMicros = micros();
   lastTelemetryMs = millis();
+  lastHeartbeatMs = millis(); // Initialize watchdog
   Serial.println(F("INFO,ARDUINO_MEGA_TREADMILL_READY"));
 }
 
-void loop() {
+void loop()
+{
   unsigned long now = micros();
-  if (now - lastControlMicros >= CONTROL_INTERVAL_US) {
+  if (now - lastControlMicros >= CONTROL_INTERVAL_US)
+  {
     lastControlMicros += CONTROL_INTERVAL_US;
-    checkSafetyInputs();
     handleProfile();
     runControl();
   }
 
   pollSerial();
 
+  // Watchdog: Stop motors if no heartbeat received
+  if (systemState == SystemState::RUNNING &&
+      millis() - lastHeartbeatMs > WATCHDOG_TIMEOUT_MS)
+  {
+    disableAllMotors();
+    motors[0].targetRpm = 0;
+    motors[1].targetRpm = 0;
+    profileActive = false;
+    systemState = SystemState::IDLE;
+    Serial.println(F("ERR,WATCHDOG_TIMEOUT"));
+  }
+
   now = millis();
-  if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+  if (now - lastTelemetryMs >= TELEMETRY_INTERVAL_MS)
+  {
     lastTelemetryMs = now;
-    publishTelemetry();
+    // Only send telemetry when treadmill is actually running
+    bool isRunning = (systemState == SystemState::RUNNING && profileActive) ||
+                     (abs(motors[0].targetRpm) > 0.1f || abs(motors[1].targetRpm) > 0.1f);
+    if (systemState != SystemState::UPLOADING && isRunning)
+    {
+      publishTelemetry();
+    }
   }
 }
